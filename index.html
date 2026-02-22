@@ -838,6 +838,33 @@ function parseWorkout(text, dayName) {
   return parseEasyWorkout(text);
 }
 
+function parseEasyWorkout(text) {
+  const t = text.toLowerCase();
+  const workout = { type: 'easy', raw: text, prescription: {} };
+
+  // Duration: "40' - 60'" or "120' - 140'" or "90'"
+  const durMatch = t.match(/(\d+)'\s*[-–]\s*(\d+)'|(\d+)'/);
+  if (durMatch) {
+    workout.prescription.durationMin = parseInt(durMatch[1] || durMatch[3]);
+    workout.prescription.durationMax = parseInt(durMatch[2] || durMatch[3]);
+  }
+
+  workout.prescription.zone = extractMainZone(t);
+  return workout;
+}
+
+function extractMainZone(text) {
+  const t = text.toLowerCase();
+  if (t.includes('d1') || t.includes('loslopen') || t.includes('herstel')) return 'd1';
+  if (t.includes('d2')) return 'd2';
+  if (t.includes('d3')) return 'd3';
+  if (t.includes('vlot')) return 'vlot';
+  if (t.includes('viad')) return 'viad';
+  if (t.includes('snel')) return 'snel';
+  if (t.includes('fartlek')) return 'd2';
+  return null;
+}
+
 function parseTrackWorkout(text) {
   const t = text.toLowerCase();
   const workout = { type: 'track', raw: text, prescription: {} };
