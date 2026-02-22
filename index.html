@@ -869,108 +869,161 @@ function parseTrackWorkout(text) {
   const t = text.toLowerCase();
   const workout = { type: 'track', raw: text, prescription: {} };
 
-  // Overall set count: "3 x", "6 á 7 x", "3 a 4 x"
-  const setMatch = t.match(/(\d+)\s*[áàa]\s*(\d+)\s*x|(\d+)\s*x/i);
-  if (setMatch) {
-    workout.prescription.setsMin = parseInt(setMatch[1] || setMatch[3]);
-    workout.prescription.setsMax = parseInt(setMatch[2] || setMatch[3]);
-  }
+  const { setsMin, setsMax, perSet } = parseWorkoutStructure(text);
+  workout.prescription.setsMin = setsMin;
+  workout.prescription.setsMax = setsMax;
 
-  // Rest info
+  // Build full ordered sequence: perSet repeated setsMax times
+  const seq = [];
+  for (let s = 0; s < setsMax; s++) perSet.forEach(e => seq.push({...e}));
+  workout.prescription.effortSequence = seq;
+  workout.prescription.paces = [...new Set(seq.map(e => e.pace))];
+
   const pMatch  = t.match(/\bp[/=]([^,\s]+)/i);
   const spMatch = t.match(/\bsp[/=]([^,\s]+)/i);
   if (pMatch)  workout.prescription.pause = pMatch[1];
   if (spMatch) workout.prescription.seriesPause = spMatch[1];
 
-  // Build the ordered effort sequence (one entry per effort lap per set)
-  workout.prescription.effortSequence = buildEffortSequence(text, workout.prescription);
-  workout.prescription.paces = [...new Set(workout.prescription.effortSequence.map(e => e.pace))];
-
   return workout;
 }
 
-// Build the ordered sequence of effort laps for one set, then expand by set count.
-// Returns array of { dist, pace } in order, repeated setsMax times.
-function buildEffortSequence(text, prescription) {
-  const perSet = parseSetStructure(text);
-  if (!perSet.length) return [];
+// ── Workout structure parser ───────────────────────────────────────────────
+// Returns { setsMin, setsMax, perSet: [{dist, pace}] }
+// Handles all 6 workout patterns from the coach's notation.
 
-  const setsMax = prescription.setsMax || prescription.setsMin || 1;
-  const result = [];
-  for (let s = 0; s < setsMax; s++) {
-    for (const effort of perSet) result.push({ ...effort });
+function parseWorkoutStructure(text) {
+  // Outer set count — "3 a 4x", "3 a 4 x", "6 á 7 X", "3 X", "1x"
+  const sm = text.match(/^\s*(\d+)\s*(?:[áàa]\s*(\d+)\s*)?[xX×]/i);
+  const setsMin = sm ? parseInt(sm[1]) : 1;
+  const setsMax = sm ? (sm[2] ? parseInt(sm[2]) : setsMin) : 1;
+  const outerEnd = sm ? sm[0].length : 0;
+
+  const groups = findParenGroups(text);
+
+  // No parens: "6 à 7 X 1300m: 300m snel + 1000m vlot"
+  if (!groups.length) {
+    let cleaned = text.slice(outerEnd).trim();
+    cleaned = cleaned.replace(/,?\s*[Pp][\s/=].*$/i, '');
+    cleaned = cleaned.replace(/^\d+\s*m\s*:\s*/i, '');
+    return { setsMin, setsMax, perSet: parseBody(cleaned) };
   }
-  return result;
+
+  // Single group: "3 X (body)" or "1x preamble 3x (body)"
+  if (groups.length === 1) {
+    const { count, body, start: gs } = groups[0];
+    // Preamble before the group
+    const preText = text.slice(0, gs).trim();
+    // If preamble is "1x ..." treat as one-off (not per-set)
+    const isOneOff = /^\s*1\s*[xX×]/i.test(preText);
+    const preamble = isOneOff ? [] : parseBody(preText.replace(/^\s*\d+\s*[xX×]\s*/i, ''));
+    const perSet = preamble.concat(parseBody(body));
+    // Prefer outer range when it differs (e.g. 6 á 7)
+    const s = (setsMin !== setsMax) ? setsMin : count;
+    const e = (setsMin !== setsMax) ? setsMax : count;
+    return { setsMin: s, setsMax: e, perSet };
+  }
+
+  // Multiple groups: "3a4x 2x(...) 2x(...) 3x(...)"
+  // outer count = sets; each group's count = reps within set
+  const perSet = [];
+  groups.forEach(({ count, body }) => {
+    parseBody(body).forEach(e => { for (let i=0;i<count;i++) perSet.push({...e}); });
+  });
+  return { setsMin, setsMax, perSet };
 }
 
-// Parse the effort laps within one set from the workout text.
-// Returns ordered array of { dist, pace }.
-function parseSetStructure(text) {
-  const t = text.toLowerCase();
+function parseBody(text) {
   const efforts = [];
-
-  // Strategy: find all "Nm pace" or "NxYm pace" patterns in order.
-  // We walk the string and collect them.
-
-  // First, strip the outer set multiplier ("3 x (...)") to get inner content
-  // Try to extract the parenthesised set body
-  const setBodyMatch = text.match(/\d+\s*[xX×]\s*\(([^)]+(?:\([^)]*\)[^)]*)*)\)/);
-  const body = setBodyMatch ? setBodyMatch[1] : text;
-
-  // Also handle "Nm: Xm pace + Ym pace" format (week 9 wed style)
-  // and inline list format (week 7 mon style)
-
-  // Pattern: optional "Nx" multiplier, then distance, then pace
-  // e.g. "800m vlot", "3x300m snel", "200m (2)", "1000m WT (200m (1)/vlot)"
-  const re = /(\d+)\s*[xX×]\s*(\d+)m\s+([^,+()\n]+)|(\d+)m\s+([^,+()\n]+)/gi;
-  let m;
-  const src = body || text;
-  while ((m = re.exec(src)) !== null) {
-    if (m[1] && m[2] && m[3]) {
-      // "3x300m snel" style
-      const count = parseInt(m[1]);
-      const dist  = parseInt(m[2]);
-      const pace  = pickPace(m[3]);
-      if (pace) for (let i = 0; i < count; i++) efforts.push({ dist, pace });
-    } else if (m[4] && m[5]) {
-      // "800m vlot" style
-      const dist = parseInt(m[4]);
-      const pace = pickPace(m[5]);
-      if (pace) efforts.push({ dist, pace });
+  splitTopLevel(text, ',+').forEach(seg => {
+    seg = seg.trim();
+    // "Nx (inner)"
+    const nm = seg.match(/^(\d+)\s*[xX×]\s*\((.+)\)\s*$/);
+    if (nm) {
+      const inner = parseBody(nm[2]);
+      for (let i=0;i<parseInt(nm[1]);i++) inner.forEach(e => efforts.push({...e}));
+      return;
     }
-  }
-
-  // Special: "1x 1000m vlot" prefix before the main sets (week 7 wed)
-  // Already captured above since we scan full text
-
+    parseSegment(seg).forEach(e => efforts.push(e));
+  });
   return efforts;
 }
 
-// Given a pace description string, return the best single pace key.
-// For ambiguous cases like "(4) a (5)" take the slower one (higher sec/km).
-// For "WT (200m (1)/vlot)" treat as vlot (the easier of the two = slower).
-// For "climaxloop (1) -> (2)" treat as midpoint.
-function pickPace(str) {
-  const s = str.toLowerCase().trim();
-  const keys = [];
+function parseSegment(seg) {
+  seg = seg.trim();
+  if (/^p\d|^sp[\s=]|^p[\s/=]/i.test(seg)) return [];
+  if (/^SP[\s=]/i.test(seg)) return [];
+  let m;
+  // "NxDISTm pace"
+  m = seg.match(/^(\d+)\s*[xX×]\s*(\d+)\s*m\s*(.*)/i);
+  if (m) {
+    const pace = pickPace(m[3]);
+    return pace ? Array(parseInt(m[1])).fill({ dist: parseInt(m[2]), pace }) : [];
+  }
+  // "DISTm pace"
+  m = seg.match(/^(\d+)\s*m\s*(.*)/i);
+  if (m) {
+    const pace = pickPace(m[2]);
+    return pace ? [{ dist: parseInt(m[1]), pace }] : [];
+  }
+  // "DIST pace" (no m, e.g. "200 (2)")
+  m = seg.match(/^(\d{2,4})\s+(.*)/);
+  if (m && parseInt(m[1]) >= 50) {
+    const pace = pickPace(m[2]);
+    return pace ? [{ dist: parseInt(m[1]), pace }] : [];
+  }
+  return [];
+}
 
-  // Named zones
+function pickPace(str) {
+  const s = str.toLowerCase();
+  const keys = [];
   for (const key of ['snel','viad','vlot','d3','d2','d1']) {
     if (s.includes(key)) keys.push(key);
   }
-  // Numbered (1)-(5)
-  const nums = [...s.matchAll(/\((\d)\)/g)];
-  for (const n of nums) {
-    if (PACE_TABLE[n[1]]) keys.push(n[1]);
+  for (const m of s.matchAll(/\((\d)\)/g)) {
+    if (PACE_TABLE[m[1]]) keys.push(m[1]);
   }
-
   if (!keys.length) return null;
   if (keys.length === 1) return keys[0];
-
-  // Multiple: for "a (5)" range take slower (higher sec/km = lower speed)
-  // For WT workouts take the slower
-  // For climaxloop take the midpoint — approximate with slower
+  // Take slowest (highest sec/km) — conservative for ambiguous cases
   return keys.reduce((a, b) => PACE_TABLE[a] > PACE_TABLE[b] ? a : b);
+}
+
+function splitTopLevel(text, delimiters) {
+  const parts = [], delSet = new Set(delimiters);
+  let depth = 0, current = [];
+  for (const c of text) {
+    if (c === '(') depth++;
+    else if (c === ')') depth--;
+    else if (delSet.has(c) && depth === 0) {
+      parts.push(current.join('').trim());
+      current = [];
+      continue;
+    }
+    current.push(c);
+  }
+  if (current.length) parts.push(current.join('').trim());
+  return parts.filter(Boolean);
+}
+
+function findParenGroups(text) {
+  const groups = [];
+  let i = 0;
+  while (i < text.length) {
+    const m = text.slice(i).match(/(\d+)\s*[xX×]\s*\(/i);
+    if (!m) break;
+    const count = parseInt(m[1]);
+    const absStart = i + m.index;
+    const parenStart = i + m.index + m[0].length - 1;
+    let depth = 0, end = parenStart;
+    for (let j = parenStart; j < text.length; j++) {
+      if (text[j] === '(') depth++;
+      else if (text[j] === ')') { depth--; if (depth === 0) { end = j; break; } }
+    }
+    groups.push({ count, body: text.slice(parenStart+1, end), start: absStart, end });
+    i = end + 1;
+  }
+  return groups;
 }
 
 function extractPaces(text) {
@@ -985,8 +1038,7 @@ function extractPaces(text) {
     { re: /\(([1-5])\)/g, key: null   },
   ];
   for (const p of patterns) {
-    const matches = [...text.matchAll(p.re)];
-    for (const m of matches) {
+    for (const m of text.matchAll(p.re)) {
       const key = p.key || m[1];
       if (PACE_TABLE[key] && !paces.includes(key)) paces.push(key);
     }
