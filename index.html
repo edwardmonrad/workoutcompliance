@@ -840,69 +840,122 @@ function parseWorkout(text, dayName) {
 
 function parseTrackWorkout(text) {
   const t = text.toLowerCase();
-  const workout = { type: 'track', raw: text, sets: [], prescription: {} };
+  const workout = { type: 'track', raw: text, prescription: {} };
 
-  // Extract set count (e.g. "3 x", "6 á 7 x", "3 a 4 x")
-  const setMatch = t.match(/(\d+)\s*[áa]\s*(\d+)\s*x|(\d+)\s*x/i);
+  // Overall set count: "3 x", "6 á 7 x", "3 a 4 x"
+  const setMatch = t.match(/(\d+)\s*[áàa]\s*(\d+)\s*x|(\d+)\s*x/i);
   if (setMatch) {
     workout.prescription.setsMin = parseInt(setMatch[1] || setMatch[3]);
     workout.prescription.setsMax = parseInt(setMatch[2] || setMatch[3]);
   }
 
-  // Extract prescribed paces mentioned
-  workout.prescription.paces = extractPaces(t);
-
-  // Parse interval structure
-  workout.prescription.description = text.replace(/bedoel.*|uitvoering.*/gi, '').trim();
-
-  // Extract rest info
-  const pMatch = t.match(/p[=/]([^,\s]+)/i);
-  const spMatch = t.match(/sp[=/]([^,\s]+)/i);
+  // Rest info
+  const pMatch  = t.match(/\bp[/=]([^,\s]+)/i);
+  const spMatch = t.match(/\bsp[/=]([^,\s]+)/i);
   if (pMatch)  workout.prescription.pause = pMatch[1];
   if (spMatch) workout.prescription.seriesPause = spMatch[1];
 
+  // Build the ordered effort sequence (one entry per effort lap per set)
+  workout.prescription.effortSequence = buildEffortSequence(text, workout.prescription);
+  workout.prescription.paces = [...new Set(workout.prescription.effortSequence.map(e => e.pace))];
+
   return workout;
 }
 
-function parseEasyWorkout(text) {
-  const t = text.toLowerCase();
-  const workout = { type: 'easy', raw: text, prescription: {} };
+// Build the ordered sequence of effort laps for one set, then expand by set count.
+// Returns array of { dist, pace } in order, repeated setsMax times.
+function buildEffortSequence(text, prescription) {
+  const perSet = parseSetStructure(text);
+  if (!perSet.length) return [];
 
-  // Duration: "40' - 60'" or "120' - 140'" or "90'"
-  const durMatch = t.match(/(\d+)'\s*[-–]\s*(\d+)'|(\d+)'/);
-  if (durMatch) {
-    workout.prescription.durationMin = parseInt(durMatch[1] || durMatch[3]);
-    workout.prescription.durationMax = parseInt(durMatch[2] || durMatch[3]);
+  const setsMax = prescription.setsMax || prescription.setsMin || 1;
+  const result = [];
+  for (let s = 0; s < setsMax; s++) {
+    for (const effort of perSet) result.push({ ...effort });
+  }
+  return result;
+}
+
+// Parse the effort laps within one set from the workout text.
+// Returns ordered array of { dist, pace }.
+function parseSetStructure(text) {
+  const t = text.toLowerCase();
+  const efforts = [];
+
+  // Strategy: find all "Nm pace" or "NxYm pace" patterns in order.
+  // We walk the string and collect them.
+
+  // First, strip the outer set multiplier ("3 x (...)") to get inner content
+  // Try to extract the parenthesised set body
+  const setBodyMatch = text.match(/\d+\s*[xX×]\s*\(([^)]+(?:\([^)]*\)[^)]*)*)\)/);
+  const body = setBodyMatch ? setBodyMatch[1] : text;
+
+  // Also handle "Nm: Xm pace + Ym pace" format (week 9 wed style)
+  // and inline list format (week 7 mon style)
+
+  // Pattern: optional "Nx" multiplier, then distance, then pace
+  // e.g. "800m vlot", "3x300m snel", "200m (2)", "1000m WT (200m (1)/vlot)"
+  const re = /(\d+)\s*[xX×]\s*(\d+)m\s+([^,+()\n]+)|(\d+)m\s+([^,+()\n]+)/gi;
+  let m;
+  const src = body || text;
+  while ((m = re.exec(src)) !== null) {
+    if (m[1] && m[2] && m[3]) {
+      // "3x300m snel" style
+      const count = parseInt(m[1]);
+      const dist  = parseInt(m[2]);
+      const pace  = pickPace(m[3]);
+      if (pace) for (let i = 0; i < count; i++) efforts.push({ dist, pace });
+    } else if (m[4] && m[5]) {
+      // "800m vlot" style
+      const dist = parseInt(m[4]);
+      const pace = pickPace(m[5]);
+      if (pace) efforts.push({ dist, pace });
+    }
   }
 
-  // Pace zone
-  workout.prescription.zone = extractMainZone(t);
+  // Special: "1x 1000m vlot" prefix before the main sets (week 7 wed)
+  // Already captured above since we scan full text
 
-  return workout;
+  return efforts;
 }
 
-function extractMainZone(text) {
-  const t = text.toLowerCase();
-  if (t.includes('d1') || t.includes('loslopen') || t.includes('herstel')) return 'd1';
-  if (t.includes('d2')) return 'd2';
-  if (t.includes('d3')) return 'd3';
-  if (t.includes('vlot')) return 'vlot';
-  if (t.includes('viad')) return 'viad';
-  if (t.includes('snel')) return 'snel';
-  if (t.includes('fartlek')) return 'd2'; // treat fartlek as D2 average
-  return null;
+// Given a pace description string, return the best single pace key.
+// For ambiguous cases like "(4) a (5)" take the slower one (higher sec/km).
+// For "WT (200m (1)/vlot)" treat as vlot (the easier of the two = slower).
+// For "climaxloop (1) -> (2)" treat as midpoint.
+function pickPace(str) {
+  const s = str.toLowerCase().trim();
+  const keys = [];
+
+  // Named zones
+  for (const key of ['snel','viad','vlot','d3','d2','d1']) {
+    if (s.includes(key)) keys.push(key);
+  }
+  // Numbered (1)-(5)
+  const nums = [...s.matchAll(/\((\d)\)/g)];
+  for (const n of nums) {
+    if (PACE_TABLE[n[1]]) keys.push(n[1]);
+  }
+
+  if (!keys.length) return null;
+  if (keys.length === 1) return keys[0];
+
+  // Multiple: for "a (5)" range take slower (higher sec/km = lower speed)
+  // For WT workouts take the slower
+  // For climaxloop take the midpoint — approximate with slower
+  return keys.reduce((a, b) => PACE_TABLE[a] > PACE_TABLE[b] ? a : b);
 }
 
 function extractPaces(text) {
   const paces = [];
   const patterns = [
-    { re: /\bsnel\b/gi,  key: 'snel' },
-    { re: /\bviad\b/gi,  key: 'viad' },
-    { re: /\bvlot\b/gi,  key: 'vlot' },
-    { re: /\bd3\b/gi,    key: 'd3'   },
-    { re: /\bd2\b/gi,    key: 'd2'   },
-    { re: /\bd1\b/gi,    key: 'd1'   },
-    { re: /\(([1-5])\)/g, key: null  },
+    { re: /\bsnel\b/gi,   key: 'snel' },
+    { re: /\bviad\b/gi,   key: 'viad' },
+    { re: /\bvlot\b/gi,   key: 'vlot' },
+    { re: /\bd3\b/gi,     key: 'd3'   },
+    { re: /\bd2\b/gi,     key: 'd2'   },
+    { re: /\bd1\b/gi,     key: 'd1'   },
+    { re: /\(([1-5])\)/g, key: null   },
   ];
   for (const p of patterns) {
     const matches = [...text.matchAll(p.re)];
@@ -1110,32 +1163,57 @@ function checkCompliance(day, activity) {
       ok: result.completionPass
     });
 
-    // Precision: check each effort lap pace
-    if (effortLaps.length > 0 && wp.paces && wp.paces.length > 0) {
-      const primaryPace = PACE_TABLE[wp.paces[0]];
-      const secondaryPace = wp.paces[1] ? PACE_TABLE[wp.paces[1]] : null;
-
+    // Precision: match effort laps in order against the prescribed sequence
+    const seq = wp.effortSequence || [];
+    if (effortLaps.length > 0 && seq.length > 0) {
       let allOk = true;
+      let anyChecked = false;
       const lapChecks = [];
 
-      for (let i = 0; i < effortLaps.length; i++) {
-        const lap = effortLaps[i];
-        const lapPace = 1000 / lap.average_speed;
+      // Match laps to sequence positions in order
+      // Use the shorter of the two lists — extra laps or missing laps are flagged
+      const maxLaps = Math.max(effortLaps.length, seq.length);
 
-        // Determine which target applies
-        let targetPace = primaryPace;
-        // Alternating pattern detection (WT workouts)
-        if (secondaryPace && wp.raw && wp.raw.toLowerCase().includes('wt')) {
-          targetPace = i % 2 === 0 ? primaryPace : secondaryPace;
+      for (let i = 0; i < maxLaps; i++) {
+        const lap = effortLaps[i];
+        const prescribed = seq[i];
+
+        if (!lap) {
+          // Missing lap
+          lapChecks.push({
+            label: `Rep ${i+1} (${prescribed.dist}m expected)`,
+            target: formatPace(PACE_TABLE[prescribed.pace]) + '/km (' + prescribed.pace + ')',
+            actual: '—',
+            delta: null,
+            ok: false
+          });
+          allOk = false;
+          continue;
         }
 
-        const delta = lapPace - targetPace;
+        if (!prescribed) {
+          // Extra lap beyond prescription — show but don't penalise
+          const lapPace = 1000 / lap.average_speed;
+          lapChecks.push({
+            label: `Rep ${i+1} (${Math.round(lap.distance)}m — extra)`,
+            target: '—',
+            actual: formatPace(lapPace),
+            delta: null,
+            ok: null
+          });
+          continue;
+        }
+
+        anyChecked = true;
+        const lapPace = 1000 / lap.average_speed;
+        const targetPaceVal = PACE_TABLE[prescribed.pace];
+        const delta = lapPace - targetPaceVal;
         const ok = Math.abs(delta) <= TRACK_TOLERANCE_SEC;
         if (!ok) allOk = false;
 
         lapChecks.push({
-          label: `Rep ${i+1} (${Math.round(lap.distance)}m)`,
-          target: formatPace(targetPace),
+          label: `Rep ${i+1} (${Math.round(lap.distance)}m / ${prescribed.dist}m)`,
+          target: formatPace(targetPaceVal) + '/km (' + prescribed.pace + ')',
           actual: formatPace(lapPace),
           delta: delta,
           ok: ok
@@ -1143,9 +1221,19 @@ function checkCompliance(day, activity) {
       }
 
       result.lapChecks = lapChecks;
-      result.precisionPass = allOk;
+      result.precisionPass = anyChecked ? allOk : null;
+    } else if (effortLaps.length > 0) {
+      // No sequence parsed — show laps without targets
+      result.lapChecks = effortLaps.map((lap, i) => ({
+        label: `Rep ${i+1} (${Math.round(lap.distance)}m)`,
+        target: '—',
+        actual: formatPace(1000 / lap.average_speed),
+        delta: null,
+        ok: null
+      }));
+      result.precisionPass = null;
     } else {
-      result.precisionPass = null; // Can't check without pace data
+      result.precisionPass = null;
     }
 
     result.overallPass = result.completionPass && (result.precisionPass !== false);
